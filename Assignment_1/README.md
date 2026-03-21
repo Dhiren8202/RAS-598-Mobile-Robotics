@@ -131,7 +131,47 @@ All parameters are in `PipelineConfig` at the top of `cylinder_pipeline.py`:
 - All geometric logic (RANSAC, normal estimation, clustering, distance calculations) is implemented with pure NumPy
 
 ---
+## Debugging and Tuning
+ 
+Getting the pipeline working correctly required several rounds of debugging and parameter tuning. Each issue was diagnosed by printing intermediate values and inspecting intermediate point clouds in RViz at each pipeline stage.
+ 
+ 
+### 1. Cylinder Marker Orientation
+ 
+The initial marker orientation used a 90° rotation around the X axis (`orientation.x = 0.7071`) which laid the cylinder on its side in RViz. After testing all quaternion combinations, the identity quaternion (`orientation.w = 1.0`, all others 0) produced the correct upright orientation in the `oakd_rgb_camera_optical_frame`. This is because the RViz cylinder marker's default Z axis aligns correctly with vertical in this camera frame without any rotation.
+ 
+---
+ 
+### 2. Cluster Radius Tuning for rgbd_bag_2
+ 
+With three cylinders in the scene, the cluster radius needed careful tuning:
+ 
+| Value | Problem |
+|---|---|
+| `0.08` | Too large — merged nearby cylinders into one blob (sizes: [959, 191]) |
+| `0.05` | Too small — split each cylinder into fragments (6 clusters instead of 3) |
+| `0.06` | Correct — consistently produced 3–4 distinct clusters |
+ 
+The right value was found by printing cluster sizes and centers at each frame and narrowing in between the two failure modes.
+ 
+---
+ 
+### 3. HSV Threshold Tuning for Red Cylinder
+ 
+The red cylinder in `rgbd_bag_2` was being classified as "unknown" instead of red. Printing the actual HSV values revealed two problems:
+ 
+- **Saturation was 0.19** — just below the original guard threshold of `s < 0.20`, so the cylinder was immediately rejected before even checking hue
+- **Hue was 337°** — outside the original red range of `h > 345°`
+ 
+Two fixes were applied:
+- Lowered saturation guard from `s < 0.20` to `s < 0.10` to allow washed-out colors through
+- Widened the red upper boundary from `h > 345°` to `h > 325°` to capture hues in the magenta-red range
+ 
+After these changes the red cylinder was correctly detected and labeled across all frames.
+ 
 
+ 
+---
 ## Results
 
 ### rgbd_bag_0 — Single Green Cylinder

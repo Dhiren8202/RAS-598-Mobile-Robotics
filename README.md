@@ -1,6 +1,6 @@
 # RAS 598 — Mobile Robotics
 
-**Student:** Dhiren Makwana
+**Student:** Dhiren Makwana  
 **Course:** RAS 598 — Mobile Robotics  
 **University:** Arizona State University  
 

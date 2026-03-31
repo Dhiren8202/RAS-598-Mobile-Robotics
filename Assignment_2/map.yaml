@@ -1,0 +1,10 @@
+image: cave_filled.png
+# CALCULATION: World Size / Image Width
+# 16.0 meters / 500 pixels = 0.032
+resolution: 0.032
+# CALCULATION: - (World Size / 2)
+# Centering a 16m world puts the bottom-left corner at -8.0, -8.0
+origin: [-8.0, -8.0, 0.0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.196

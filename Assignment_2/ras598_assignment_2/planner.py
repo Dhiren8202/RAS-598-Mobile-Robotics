@@ -1,6 +1,5 @@
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist, Point
 from visualization_msgs.msg import MarkerArray, Marker
@@ -449,9 +448,9 @@ class PathPlanner(Node):
 
                 # decide maximum allowed jump distance based on location
                 if self.in_tight_corridor(wx1, wy1) or self.in_tight_corridor(wx2, wy2):
-                    max_jump = 6.0   # be careful in tight areas, limit jump to 6m
+                    max_jump = 7.0   # tight corridors - shorter jumps to avoid wall clipping
                 else:
-                    max_jump = 50.0  # open area, no practical limit
+                    max_jump = 50.0  # open areas - no practical limit needed
 
                 # calculate straight line distance of this potential jump
                 jump_dist = math.sqrt((wx2 - wx1)**2 + (wy2 - wy1)**2)
@@ -582,101 +581,129 @@ class PathPlanner(Node):
 
     def start_controller(self):
         """
-        Starts the controller timer that runs every 0.1 seconds.
-        The control_loop function is called repeatedly until the robot reaches the goal.
+        Initializes and starts the control timer.
+        The control_loop runs every 0.1 seconds until the mission is complete.
+        We always start in rotating mode so the robot faces the first waypoint
+        before it starts moving.
         """
-        self.current_target_idx = 0      # start from the first waypoint
-        self.mission_active     = True   # tell control_loop to start running
+        self.current_target_idx = 0
+        self.mission_active     = True
+        self.rotating_to_next   = True   # always rotate first before driving
+        self.segment_start_x    = self.robot_x  # records where each straight segment starts
+        self.segment_start_y    = self.robot_y
         self.control_timer      = self.create_timer(0.1, self.control_loop)
         self.get_logger().info("Controller started!")
 
 
+    def calc_lateral_drift(self, target_x, target_y):
+        """
+        Calculates how far sideways (laterally) the robot has drifted
+        from the intended straight line between segment_start and target.
+
+        Uses the cross product formula:
+        lateral_drift = |(target - start) x (robot - start)| / |target - start|
+
+        Returns the perpendicular distance from the line in meters.
+        """
+        # vector from segment start to target
+        line_dx = target_x - self.segment_start_x
+        line_dy = target_y - self.segment_start_y
+        line_len = math.sqrt(line_dx**2 + line_dy**2)
+
+        if line_len < 0.001:
+            return 0.0
+
+        # vector from segment start to robot current position
+        robot_dx = self.robot_x - self.segment_start_x
+        robot_dy = self.robot_y - self.segment_start_y
+
+        # cross product magnitude = lateral distance from the line
+        cross = abs(line_dx * robot_dy - line_dy * robot_dx)
+        return cross / line_len
+
+
     def control_loop(self):
         """
-        The main driving controller - runs every 0.1 seconds.
-        
-        Implements a Turn-Go-Turn state machine with two states:
-        
-        STATE 1 - ROTATE: If the heading error is large (> 1.2 radians = ~69 degrees),
-                          rotate in place to face the target waypoint.
-                          
-        STATE 2 - DRIVE:  Once facing roughly the right direction, drive forward.
-                          Speed depends on distance to waypoint:
-                          - Far away (> 1.0m): full speed 0.3 m/s
-                          - Getting close (0.5-1.0m): medium speed 0.2 m/s  
-                          - Almost there (< 0.5m): slow speed 0.1 m/s
-                          Also applies gentle angular correction while driving
-                          to stay on course without stopping to rotate.
-        
-        The gentle angular correction during driving is key to energy efficiency -
-        it avoids the startup tax (0.6 energy) that triggers every time the robot
-        goes from stopped to moving.
+        Pure Turn-Go-Turn controller with lateral drift detection.
+
+        STATE 1 - ROTATE: Stop completely and rotate precisely to face the waypoint.
+                          Stay in this state until angle error < 0.03 rad (~2 degrees).
+
+        STATE 2 - DRIVE:  Drive straight forward with angular.z = exactly 0.0.
+                          Monitor lateral drift from the intended straight line.
+                          If drift exceeds 0.3m, stop and go back to STATE 1 to re-align.
+                          This gives ONE clean correction instead of many micro-corrections.
         """
-        # do nothing if mission is not active
         if not self.mission_active:
             return
 
-        # check if all waypoints are done
         if self.current_target_idx >= len(self.pruned_path):
             self.stop_robot()
             self.mission_active = False
             self.get_logger().info("Mission complete!")
             return
 
-        # update the red sphere position in RViz
         self.update_goal_marker()
 
-        # get the current target waypoint
         target_x, target_y = self.pruned_path[self.current_target_idx]
 
-        # calculate how far away the target is and what direction it is
-        dx              = target_x - self.robot_x   # x distance to target
-        dy              = target_y - self.robot_y   # y distance to target
-        distance        = math.sqrt(dx**2 + dy**2)  # straight line distance in meters
-        angle_to_target = math.atan2(dy, dx)        # angle we need to face (radians)
+        dx              = target_x - self.robot_x
+        dy              = target_y - self.robot_y
+        distance        = math.sqrt(dx**2 + dy**2)
+        angle_to_target = math.atan2(dy, dx)
 
-        # angle_error = how much we need to rotate to face the target
         angle_error = angle_to_target - self.robot_yaw
-
-        # normalize angle to [-pi, pi] to always take the shortest rotation
-        # without this, robot might rotate 350 degrees the wrong way instead of 10 degrees
         while angle_error >  math.pi: angle_error -= 2 * math.pi
         while angle_error < -math.pi: angle_error += 2 * math.pi
 
-        # if we are close enough to the waypoint, mark it as reached and move to next one
+        # waypoint reached
         if distance < 0.45:
             self.current_target_idx += 1
+            self.rotating_to_next = True  # must re-align for next waypoint
             self.get_logger().info(
                 f"Waypoint {self.current_target_idx} reached, "
                 f"{len(self.pruned_path) - self.current_target_idx} remaining"
             )
             return
 
-        cmd = Twist()  # velocity command message (linear.x = forward speed, angular.z = rotation)
+        cmd = Twist()
 
-        # STATE 1: ROTATE - angle error is too large, rotate to face the target
-        if abs(angle_error) > 1.2:
-            cmd.angular.z = 0.6 * angle_error              # rotation speed proportional to error
-            cmd.angular.z = max(-1.0, min(1.0, cmd.angular.z))  # clamp to max 1.0 rad/s
-            cmd.linear.x  = 0.0                            # no forward motion while rotating
-
-        # STATE 2: DRIVE - heading is good enough, drive forward toward the target
-        else:
-            # slow down as we get closer to the waypoint to avoid overshooting
-            if distance > 1.0:
-                cmd.linear.x = 0.3   # full speed when far away
-            elif distance > 0.5:
-                cmd.linear.x = 0.2   # slow down when getting close
+        # STATE 1: ROTATE - align precisely with next waypoint
+        if self.rotating_to_next:
+            if abs(angle_error) > 0.03:
+                # rotate slowly and precisely
+                cmd.angular.z = 1.0 * angle_error
+                cmd.angular.z = max(-1.5, min(1.5, cmd.angular.z))
+                cmd.linear.x  = 0.0
             else:
-                cmd.linear.x = 0.1   # very slow when almost at the waypoint
+                # perfectly aligned - switch to drive and record segment start
+                self.rotating_to_next  = False
+                self.segment_start_x   = self.robot_x
+                self.segment_start_y   = self.robot_y
+                self.get_logger().info(f"Aligned! Driving straight to waypoint {self.current_target_idx}")
 
-            # gentle angular correction while driving keeps us on track
-            # this avoids stopping completely just to correct heading
-            # and dramatically reduces startup taxes (energy penalty)
-            cmd.angular.z = 0.4 * angle_error
+        # STATE 2: DRIVE - go straight with angular.z = 0.0
+        else:
+            # check lateral drift from intended straight line
+            drift = self.calc_lateral_drift(target_x, target_y)
+
+            if drift > 0.4:
+                # drifted too far off the line - stop and re-rotate
+                self.rotating_to_next = True
+                self.get_logger().info(f"Drift={drift:.2f}m - stopping to re-align")
+                cmd.linear.x  = 0.0
+                cmd.angular.z = 0.0
+            else:
+                # still on track - drive straight
+                if distance > 1.0:
+                    cmd.linear.x = 0.3
+                elif distance > 0.5:
+                    cmd.linear.x = 0.2
+                else:
+                    cmd.linear.x = 0.1
+                cmd.angular.z = 0.0  # exactly zero - pure straight line
 
         self.vel_pub.publish(cmd)
-
 
     def stop_robot(self):
         """
